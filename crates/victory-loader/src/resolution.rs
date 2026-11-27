@@ -322,6 +322,18 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         // SAFETY: the caller's promise.
         let done = unsafe { write(base, size, site, &code) };
         let offset = format!("{:#x}", site.at);
+        // The bytes are already what this would write: the loader's hooks
+        // (`crate::hooks`, `VICTORY_RENDER_SCALE`) patched the same immediate
+        // first. Not a refusal.
+        if matches!(done, Patched::Differs)
+            && site.at + code.len() <= size
+            // SAFETY: within the mapped image (checked above).
+            && unsafe { std::slice::from_raw_parts((base + site.at) as *const u8, code.len()) } == code.as_slice()
+        {
+            tracing::info!(site = %offset, what = site.what, value, "resolution: already as asked (patched by the loader's hooks)");
+            println!("resolution: {} ({value}) at title+{offset}: already as asked", site.what);
+            continue;
+        }
         match done {
             Patched::Done => tracing::info!(site = %offset, what = site.what, value, "resolution: patched"),
             Patched::Differs => tracing::warn!(site = %offset, what = site.what, "resolution: not patched, the title's bytes there are not the ones expected (another build?)"),
