@@ -789,6 +789,12 @@ fn stood(since: std::time::Instant) {
     CARD_CLOCK_US[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// The card busy a frame by [`CARD_CLOCK_US`] (frame time less the time
+/// nothing of ours was queued), in hundredths of a millisecond, as the last
+/// [`card_clock_line`] found it: for the frame line, whose "waited for the
+/// GPU" is only the submitting thread's waits.
+static CARD_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What [`CARD_CLOCK_US`] is measured with.
 struct CardClock {
     fence: ID3D12Fence,
@@ -837,6 +843,9 @@ fn card_clock_watch(clock: &'static CardClock) {
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+    // For the frame line: the card busy (something of ours queued), in
+    // hundredths of a millisecond a frame.
+    CARD_BUSY.store(((ms - idle).max(0.0) * 100.0) as u64, Ordering::Relaxed);
     tracing::info!(
         "the card's clock per frame: nothing of ours queued {idle:.1} ms (the card about {:.0}% busy by this count), \
          {behind:.1} ms of that while the submitting thread was working (the card idle behind us), the rest while the title \
@@ -5150,6 +5159,7 @@ impl Host {
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        crate::critical::relay(landing.elapsed().as_nanos() as u64);
         {
             let mut line = line();
             let Line {
@@ -8448,6 +8458,8 @@ impl Batch {
         }
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
+        crate::critical::refresh_count(0, 1);
+        crate::critical::refresh_count(1, spans.len());
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
@@ -8457,17 +8469,22 @@ impl Batch {
         let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
-            #[cfg(feature = "diagnostics")]
+            let told = std::time::Instant::now();
             let all = spans.len();
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            crate::critical::refresh_part(2, told);
+            crate::critical::refresh_count(3, all - spans.len());
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
         let ahead = spans.len() > 1;
         if ahead {
+            let asking = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
+            crate::critical::refresh_part(4, asking);
         }
+        let updates = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
@@ -8480,10 +8497,13 @@ impl Batch {
             if many && shadow.nothing_new(*from, *to - *from) {
                 #[cfg(feature = "diagnostics")]
                 FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                crate::critical::refresh_count(3, 1);
                 return;
             }
             Self::update(shadow, *from, *to);
         });
+        crate::critical::refresh_part(5, updates);
+        crate::critical::refresh_part(7, started);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8589,15 +8609,22 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        let whole = std::time::Instant::now();
+        let textures = std::time::Instant::now();
         self.refresh_textures();
+        crate::critical::refresh_part(6, textures);
         self.index.clear();
         if self.refreshes.is_empty() {
+            crate::critical::refresh_part(7, whole);
             return;
         }
+        crate::critical::refresh_count(0, 1);
+        crate::critical::refresh_count(1, self.refreshes.len());
         #[cfg(feature = "diagnostics")]
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
         let _flush = crate::timeline::span("refreshes of copies");
         self.flush_all();
+        crate::critical::refresh_part(7, whole);
         #[cfg(feature = "diagnostics")]
         {
             SPLIT[6].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -8617,10 +8644,11 @@ impl Batch {
         let beside = light && crate::watch::port_guard_plan() && wide_refresh() && self.refreshes.len() >= 4;
         if light && self.refreshes.len() <= FEW && !beside {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
             self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::critical::refresh_part(2, started);
+            crate::critical::refresh_count(3, all - self.refreshes.len());
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
@@ -8637,7 +8665,9 @@ impl Batch {
                 .collect();
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::critical::refresh_part(4, started);
         }
+        let updates = std::time::Instant::now();
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -8654,6 +8684,7 @@ impl Batch {
                     if (refreshes.len() > FEW || beside) && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                        crate::critical::refresh_count(3, 1);
                         return;
                     }
                     Self::update(shadow, *from, *to);
@@ -8673,6 +8704,7 @@ impl Batch {
                 Self::update(&shadow, from, to);
             }
         }
+        crate::critical::refresh_part(5, updates);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9193,6 +9225,7 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        crate::critical::frame_end();
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
@@ -9411,6 +9444,7 @@ impl Meter {
                         per_frame(6) / 1e3
                     );
                 }
+                let card_busy = CARD_BUSY.load(Ordering::Relaxed) as f64 / 100.0;
                 tracing::info!(
                     "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                      {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -9418,7 +9452,7 @@ impl Meter {
                      dropped {dropped:.0} without a host pipeline ({making} being made) and \
                      {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                      textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                     {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused};                      the card busy {card_busy:.1} ms/frame (our fence clock; \"on the GPU\" above is only the submitting thread's own waits)",
                     picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                     picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                     picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),
@@ -9440,6 +9474,7 @@ impl Meter {
                     placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                     objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
                 );
+                crate::critical::line();
                 #[cfg(feature = "diagnostics")]
                 {
                     let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
