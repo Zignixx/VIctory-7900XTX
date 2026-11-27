@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod agility;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -180,7 +181,18 @@ enum Console {
 }
 
 fn main() -> Result<()> {
+    // The Agility runtime beside the exe, or the system's (`agility::choose`).
+    let agility = agility::choose();
+    std::hint::black_box(&agility::D3D12SDKPath);
     victory_core::logging::init("info");
+    eprintln!(
+        "D3D12 runtime: {}",
+        if agility {
+            r"the Agility SDK's beside the executable (.\D3D12\, version 620)"
+        } else {
+            r"the system's (no .\D3D12\D3D12Core.dll beside the executable)"
+        }
+    );
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if victory_hle::modules::audio::capture::child() {
