@@ -5353,6 +5353,15 @@ impl Host {
             return;
         }
         late_threads();
+        // Fills behind a copy at its place take its bytes
+        // (`place::forwarding`, Grimkaaah f2586ef), before anything looks at
+        // what steps read: the cut below, the submission's waits and what is
+        // done on the card.
+        if place::forwarding() {
+            let written = line().written.clone();
+            let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+            place::forward_fills(&runs, &written);
+        }
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
@@ -9249,6 +9258,12 @@ impl Meter {
             late_line(frames);
             crate::queue::behind_line(frames);
             card_clock_line(frames, ms);
+            if place::forwarding() {
+                tracing::info!(
+                    "fills of upload memory that took their bytes from a copy at its place, per frame (VICTORY_FILL_FORWARD=1): {:.1}",
+                    place::FORWARDED.swap(0, Ordering::Relaxed) as f64 / frames
+                );
+            }
             upq::line(frames);
             rec::line(frames);
             #[cfg(feature = "diagnostics")]
